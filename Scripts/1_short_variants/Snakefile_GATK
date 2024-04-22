@@ -1,0 +1,454 @@
+#Activate snakemake environment
+
+import os.path as osp
+import re
+import pandas as pd
+
+
+parameters_file = "./parameters"
+parameters_df = pd.read_csv(parameters_file, sep='\t')
+parameters = parameters_df['locations'].tolist()
+
+folder = parameters[0]
+picard = parameters[1]
+ref = "{}/Reference_data/hg19.fa".format(folder)
+
+with open("{}/Scripts/1_short_variants/sample_IDs".format(folder), "r") as f:
+	samples = [x.rstrip() for x in f]
+
+print('Starting analysis pipeline for samples: {}'.format(samples))
+
+rule all:
+	input:
+		expand("{folder}/{sample}/{sample}_WGS_hg19_haplotypecaller.norm.vcf.gz", folder=folder, sample=samples),
+		expand("{folder}/{sample}/{sample}_WGS_hg19_DeepVariant.norm.vcf.gz", folder=folder, sample=samples),
+		expand("{folder}/{sample}/{sample}_WGS_hg19_BWA_recalibrated_metrics.txt", folder=folder, sample=samples)
+
+
+rule FastqToSam:
+	input:
+		ref="{folder}/Reference_data/hg19.fa",
+		r1="{folder}/{sample}/{sample}_R1.fastq",
+		r2="{folder}/{sample}/{sample}_R2.fastq"
+	output:
+		bam=temp("{folder}/{sample}/{sample}.unaligned.bam")
+	params:
+		PICARD="{}/picard.jar".format(picard),
+		TMP_DIR="{folder}/intermediate_results"
+	log:
+		log="{folder}/{sample}/Console_outputs/01_FastqToSam.{sample}.log"
+	shell:
+		"""
+		start=$(date)
+		echo $start
+		echo "Starting FastqToSam command for sample {wildcards.sample}"
+		SECONDS=0
+		echo " "
+		java -jar {params.PICARD} FastqToSam \
+		    F1={input.r1} F2={input.r2} \
+		    O={output.bam} SAMPLE_NAME={wildcards.sample} \
+			TMP_DIR={params.TMP_DIR} MAX_RECORDS_IN_RAM=5000000 \
+		    LIBRARY_NAME=TruSeqDNA_PCRfree PLATFORM=ILLUMINA &> {log.log}
+		echo " "
+		end=$(date)
+		echo $end
+		duration=$SECONDS
+		echo "FastqToSam command for sample {wildcards.sample} completed."
+		echo "The analysis completed in $(($duration / 60)) minutes and $(($duration % 60)) seconds elapsed."
+		echo " "
+		"""
+
+
+rule MarkIlluminaAdapters:
+	input:
+		unaligned="{folder}/{sample}/{sample}.unaligned.bam"
+	output:
+		bam=temp("{folder}/{sample}/{sample}.markilluminaadapters.bam"),
+		metrics="{folder}/{sample}/{sample}_markilluminaadapters_metrics.txt"
+	params:
+		PICARD="{}/picard.jar".format(picard),
+		TMP_DIR="{folder}/intermediate_results"
+	log:
+		log="{folder}/{sample}/Console_outputs/02_MarkIlluminaAdapters.{sample}.log"
+	shell:
+		"""
+		start=$(date)
+		echo $start
+		echo "Starting MarkIlluminaAdapters command for sample {wildcards.sample}"
+		SECONDS=0
+		echo " "
+		java -jar {params.PICARD} MarkIlluminaAdapters \
+		    I={input.unaligned} \
+		    O={output.bam} \
+		    M={output.metrics} MAX_RECORDS_IN_RAM=5000000 \
+			TMP_DIR={params.TMP_DIR} &> {log.log}
+		echo " "
+		end=$(date)
+		echo $end
+		duration=$SECONDS
+		echo "MarkIlluminaAdapters command for sample {wildcards.sample} completed."
+		echo "The analysis completed in $(($duration / 60)) minutes and $(($duration % 60)) seconds elapsed."
+		echo " "
+		"""
+
+rule PipedAlignment:
+	input:
+		ref="{folder}/Reference_data/hg19.fa",
+		unaligned="{folder}/{sample}/{sample}.unaligned.bam",
+		marked="{folder}/{sample}/{sample}.markilluminaadapters.bam"
+	output:
+		aligned=temp("{folder}/{sample}/{sample}.mergealignment_piped.bam")
+	params:
+		PICARD="{}/picard.jar".format(picard),
+		TMP_DIR="{folder}/intermediate_results"
+	log:
+		log="{folder}/{sample}/Console_outputs/03_PipedAlignment.{sample}.log"
+	shell:
+		"""
+		start=$(date)
+		echo $start
+		echo "Starting SamToFastq | BWA | MergeBamAlignment piped command for sample {wildcards.sample}"
+		SECONDS=0
+		echo ' '
+		java -jar {params.PICARD} SamToFastq \
+		      I={input.marked} \
+		      FASTQ=/dev/stdout \
+		      CLIPPING_ATTRIBUTE=XT \
+		      CLIPPING_ACTION=2 \
+			  TMP_DIR={params.TMP_DIR} MAX_RECORDS_IN_RAM=5000000 \
+		      INTERLEAVE=true NON_PF=true USE_JDK_DEFLATER=true USE_JDK_INFLATER=true | \
+		bwa mem -M -t 10 -v 0 -p {input.ref} /dev/stdin | \
+		java -jar {params.PICARD} MergeBamAlignment \
+		      R={input.ref} UNMAPPED_BAM={input.unaligned} ALIGNED_BAM=/dev/stdin O={output.aligned} \
+		      ADD_MATE_CIGAR=true CLIP_ADAPTERS=false CLIP_OVERLAPPING_READS=true INCLUDE_SECONDARY_ALIGNMENTS=true \
+			  TMP_DIR={params.TMP_DIR} MAX_INSERTIONS_OR_DELETIONS=-1 MAX_RECORDS_IN_RAM=5000000 \
+			  PRIMARY_ALIGNMENT_STRATEGY=MostDistant ATTRIBUTES_TO_RETAIN=XS
+		echo ' '
+		end=$(date)
+		echo $end
+		duration=$SECONDS
+		echo 'SamToFastq | BWA | MergeBamAlignment command for sample {wildcards.sample} completed.'
+		echo 'The analysis completed in $(($duration / 60)) minutes and $(($duration % 60)) seconds elapsed.'
+		"""
+
+
+rule markDuplicates:
+	input:
+		aligned="{folder}/{sample}/{sample}.mergealignment_piped.bam",
+		ref="{folder}/Reference_data/hg19.fa"
+	output:
+		dupmarked=temp("{folder}/{sample}/{sample}_hg19_dupmark.sorted.bam"),
+		metrics="{folder}/{sample}/{sample}_hg19_marked_dup_metrics.txt"
+	params:
+		PICARD="{}/picard.jar".format(picard),
+		TMP_DIR="{folder}/intermediate_results"
+	log:
+		log="{folder}/{sample}/Console_outputs/04_markDuplicates.{sample}.log"
+	shell:
+		"""
+		start=$(date)
+		echo $start
+		echo "Starting MarkDuplicates command for sample {wildcards.sample}"
+		SECONDS=0
+		echo " "
+		java -jar {params.PICARD} MarkDuplicates \
+		      I={input.aligned} \
+		      O={output.dupmarked} \
+		      M={output.metrics} MAX_RECORDS_IN_RAM=5000000 \
+			  TMP_DIR={params.TMP_DIR} &> {log.log}
+		echo " "
+		end=$(date)
+		echo $end
+		duration=$SECONDS
+		echo "MarkDuplicates command for sample {wildcards.sample} completed."
+		echo "The analysis completed in $(($duration / 60)) minutes and $(($duration % 60)) seconds elapsed."
+		"""
+
+
+rule BQSR:
+	input:
+		dupmarked="{folder}/{sample}/{sample}_hg19_dupmark.sorted.bam",
+		known="{folder}/Reference_data/known_variants/dbSNP_hg19_common_variants.vcf",
+		ref="{folder}/Reference_data/hg19.fa"
+	output:
+		recalibrated="{folder}/{sample}/{sample}_WGS_hg19_recalibrated.sorted.bam"
+	params:
+		PICARD="{}/picard.jar".format(picard),
+		TMP_DIR="{folder}/intermediate_results"
+	log:
+		log="{folder}/{sample}/Console_outputs/05_BQSR.{sample}.log"
+	shell:
+		"""
+		start=$(date)
+		echo $start
+		echo "Starting BaseRecalibrator | Apply BQSR piped command for sample {wildcards.sample}"
+		SECONDS=0
+		echo " "
+		gatk BaseRecalibrator \
+		           -I {input.dupmarked} \
+		           -R {input.ref} \
+		           --known-sites {input.known} \
+				   --tmp-dir {params.TMP_DIR} \
+		           -O /home/analyst/intermediate_results/recal_data.table
+		gatk ApplyBQSR \
+		           -R {input.ref} \
+		           -I {input.dupmarked} \
+		           --bqsr-recal-file /home/analyst/intermediate_results/recal_data.table \
+				   --tmp-dir {params.TMP_DIR} \
+		           -O {output.recalibrated}
+		#-O /dev/stdout &> {log.log} | \
+		#-O {output.recalibrated} &> {log.log}
+		echo " "
+		end=$(date)
+		echo $end
+		duration=$SECONDS
+		echo "BaseRecalibrator | Apply BQSR piped command for sample {wildcards.sample} completed."
+		echo "The analysis completed in $(($duration / 60)) minutes and $(($duration % 60)) seconds elapsed."
+		"""
+
+
+
+rule CollectWgsMetrics:
+	input:
+		ref="{folder}/Reference_data/hg19.fa",
+		recalibrated="{folder}/{sample}/{sample}_WGS_hg19_recalibrated.sorted.bam"
+	output:
+		metrics="{folder}/{sample}/{sample}_WGS_hg19_BWA_recalibrated_metrics.txt"
+	params:
+		PICARD="{}/picard.jar".format(picard)
+	log:
+		log="{folder}/{sample}/Console_outputs/07_CollectWgsMetrics.{sample}.log"
+	shell:
+		"""
+		start=$(date)
+		echo $start
+		echo "Starting CollectWgsMetrics command for sample {wildcards.sample}"
+		SECONDS=0
+		echo " "
+
+		java -jar {params.PICARD} CollectWgsMetrics \
+		    I={input.recalibrated} \
+		    O={output.metrics} \
+		    R={input.ref} MAX_RECORDS_IN_RAM=5000000 &> {log.log}
+
+		echo " "
+		end=$(date)
+		echo $end
+		duration=$SECONDS
+		echo "The analysis completed in $(($duration / 60)) minutes and $(($duration % 60)) seconds elapsed."
+		"""
+
+
+
+rule HaplotypeCaller:
+	input:
+		ref="{folder}/Reference_data/hg19.fa",
+		recalibrated="{folder}/{sample}/{sample}_WGS_hg19_recalibrated.sorted.bam"
+	output:
+		vcf="{folder}/{sample}/{sample}_WGS_hg19_haplotypecaller.vcf.gz",
+		idx="{folder}/{sample}/{sample}_WGS_hg19_haplotypecaller.vcf.gz.tbi"
+	params:
+		TMP_DIR="{folder}/intermediate_results"
+	log:
+		log="{folder}/{sample}/Console_outputs/08_HaplotypeCaller.{sample}.log"
+	shell:
+		"""
+		start=$(date)
+		echo $start
+		echo "Starting HaplotypeCaller command for sample {wildcards.sample}"
+		SECONDS=0
+		echo " "
+
+		gatk HaplotypeCaller \
+		    -R {input.ref} \
+		    -I {input.recalibrated} \
+		    -O {output.vcf} \
+			--tmp-dir {params.TMP_DIR} \
+		    --pcr-indel-model NONE &> {log.log}
+
+		echo " "
+		end=$(date)
+		echo $end
+		duration=$SECONDS
+		echo "HaplotypeCaller command for sample {wildcards.sample} completed."
+		echo "The analysis completed in $(($duration / 60)) minutes and $(($duration % 60)) seconds elapsed."
+		"""
+
+rule CNNScoreVariants:
+	input:
+		ref="{folder}/Reference_data/hg19.fa",
+		bam="{folder}/{sample}/{sample}_WGS_hg19_recalibrated.sorted.bam",
+		vcf=ancient("{folder}/{sample}/{sample}_WGS_hg19_haplotypecaller.vcf.gz")
+	output:
+		scored_vcf=temp("{folder}/{sample}/{sample}_WGS_hg19_haplotypecaller_scored.vcf.gz")
+	params:
+		TMP_DIR="{folder}/intermediate_results",
+		drive="{folder}/"
+	log:
+		log="{folder}/{sample}/Console_outputs/09_CNNScoreVariants.{sample}.log"
+	shell:
+		"""
+		start=$(date)
+		echo $start
+		echo "Starting CNNScoreVariants analysis for sample {wildcards.sample}"
+		SECONDS=0
+		echo " "
+
+		newgrp docker
+		docker run -v {params.drive}:"/dest" -v {params.TMP_DIR}:"/tmp" \
+				broadinstitute/gatk gatk CNNScoreVariants \
+   				-I /dest/{wildcards.sample}/{wildcards.sample}_WGS_hg19_recalibrated.sorted.bam \
+   				-V /dest/{wildcards.sample}/{wildcards.sample}_WGS_hg19_haplotypecaller.vcf.gz \
+   				-R {folder}/Reference_data/hg19.fa \
+   				-O /dest/{wildcards.sample}/{wildcards.sample}_WGS_hg19_haplotypecaller_scored.vcf.gz \
+				--tmp-dir /tmp \
+   				-tensor-type read_tensor &> {log.log}
+
+		echo " "
+		end=$(date)
+		echo $end
+		duration=$SECONDS
+		echo "CNNScoreVariants analysis for sample {wildcards.sample} completed."
+		echo "The analysis completed in $(($duration / 60)) minutes and $(($duration % 60)) seconds elapsed."
+		"""
+
+
+rule FilterVariantTranches:
+	input:
+		known="{folder}/Reference_data/known_variants/dbSNP_hg19_common_variants.vcf",
+		mills="{folder}/Reference_data/known_variants/Mills_and_1000G_gold_standard.indels.hg19.sites.vcf",
+		scored_vcf="{folder}/{sample}/{sample}_WGS_hg19_haplotypecaller_scored.vcf.gz"
+	output:
+		filtered_vcf="{folder}/{sample}/{sample}_WGS_hg19_haplotypecaller_filtered.vcf.gz"
+	params:
+		drive="{folder}/"
+	log:
+		log="{folder}/{sample}/Console_outputs/10_FilterVariantTranches.{sample}.log"
+	shell:
+		"""
+		start=$(date)
+		echo $start
+		echo "Starting FilterVariantTranches analysis for sample {wildcards.sample}"
+		SECONDS=0
+		echo " "
+
+		gatk FilterVariantTranches \
+			   -V {input.scored_vcf} \
+			   --resource {input.known} \
+			   --resource {input.mills} \
+			   --info-key CNN_2D \
+			   --snp-tranche 99.95 \
+			   --indel-tranche 99.4 \
+			   --invalidate-previous-filters \
+			   -O {output.filtered_vcf} &> {log.log}
+
+		echo " "
+		end=$(date)
+		echo $end
+		duration=$SECONDS
+		echo "FilterVariantTranches analysis for sample {wildcards.sample} completed."
+		echo "The analysis completed in $(($duration / 60)) minutes and $(($duration % 60)) seconds elapsed."
+		"""
+
+
+rule DeepVariant:
+	input:
+		ref="{folder}/Reference_data/hg19.fa",
+		recalibrated="{folder}/{sample}/{sample}_WGS_hg19_recalibrated.sorted.bam"
+	output:
+		vcf_2="{folder}/{sample}/{sample}_WGS_hg19_DeepVariant.vcf.gz"
+	params:
+		TMP_DIR="{folder}/intermediate_results/DeepVariant/{sample}",
+		drive="{folder}/"
+	log:
+		log="{folder}/{sample}/Console_outputs/11_DeepVariant.{sample}.log"
+	shell:
+		"""
+		start=$(date)
+		echo $start
+		echo "Starting DeepVariant analysis for sample {wildcards.sample}"
+		SECONDS=0
+		echo " "
+
+		mkdir -p {params.TMP_DIR}
+		newgrp docker
+		docker run -v {params.drive}:"/dest" -v {params.TMP_DIR}:"/tmp" \
+			google/deepvariant \
+			/opt/deepvariant/bin/run_deepvariant \
+			--model_type=WGS \
+			--ref=/dest/Reference_data/hg19.fa \
+			--reads=/dest/{wildcards.sample}/{wildcards.sample}_WGS_hg19_recalibrated.sorted.bam \
+			--output_vcf=/dest/{wildcards.sample}/{wildcards.sample}_WGS_hg19_DeepVariant.vcf.gz \
+			--intermediate_results_dir=/tmp \
+			--num_shards=25 &> {log.log}
+
+		echo " "
+		end=$(date)
+		echo $end
+		duration=$SECONDS
+		echo "DeepVariant analysis for sample {wildcards.sample} completed."
+		echo "The analysis completed in $(($duration / 60)) minutes and $(($duration % 60)) seconds elapsed."
+		"""
+
+rule Normalize_HC_VCF:
+	input:
+		ref="{folder}/Reference_data/hg19.fa",
+		filtered_vcf="{folder}/{sample}/{sample}_WGS_hg19_haplotypecaller_filtered.vcf.gz"
+	output:
+		norm_vcf="{folder}/{sample}/{sample}_WGS_hg19_haplotypecaller.norm.vcf.gz"
+	params:
+		TMP_DIR="{folder}/intermediate_results"
+	log:
+		log="{folder}/{sample}/Console_outputs/12_Normalize_HC_VCF.{sample}.log"
+	conda:
+		"./envs/bcftools_env.yml"
+	shell:
+		"""
+		start=$(date)
+		echo $start
+		echo "Starting normalization of HaplotypeCaller VCF for sample {wildcards.sample}"
+		SECONDS=0
+		echo " "
+
+		bcftools norm -f {input.ref} -m -any -o {output.norm_vcf} {input.filtered_vcf} &> {log.log}
+		tabix -p vcf {output.norm_vcf}
+
+		echo " "
+		end=$(date)
+		echo $end
+		duration=$SECONDS
+		echo "Normalization of HaplotypeCaller VCF for sample {wildcards.sample} completed."
+		echo "The analysis completed in $(($duration / 60)) minutes and $(($duration % 60)) seconds elapsed."
+		"""
+
+
+rule Normalize_DV_VCF:
+	input:
+		ref="{folder}/Reference_data/hg19.fa",
+		filtered_vcf="{folder}/{sample}/{sample}_WGS_hg19_DeepVariant.vcf.gz"
+	output:
+		norm_vcf="{folder}/{sample}/{sample}_WGS_hg19_DeepVariant.norm.vcf.gz"
+	params:
+		TMP_DIR="{folder}/intermediate_results"
+	log:
+		log="{folder}/{sample}/Console_outputs/12_Normalize_DV_VCF.{sample}.log"
+	conda:
+		"./envs/bcftools_env.yml"
+	shell:
+		"""
+		start=$(date)
+		echo $start
+		echo "Starting normalization of DeepVariant VCF for sample {wildcards.sample}"
+		SECONDS=0
+		echo " "
+
+		bcftools norm -f {input.ref} -m -any -o {output.norm_vcf} {input.filtered_vcf} &> {log.log}
+		tabix -p vcf {output.norm_vcf}
+
+		echo " "
+		end=$(date)
+		echo $end
+		duration=$SECONDS
+		echo "Normalization of DeepVariant VCF for sample {wildcards.sample} completed."
+		echo "The analysis completed in $(($duration / 60)) minutes and $(($duration % 60)) seconds elapsed."
+		"""

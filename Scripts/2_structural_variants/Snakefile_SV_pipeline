@@ -1,0 +1,676 @@
+import os.path as osp
+import re
+import pandas as pd
+
+parameters_file = "./parameters"
+parameters_df = pd.read_csv(parameters_file, sep='\t')
+parameters = parameters_df['locations'].tolist()
+
+folder = parameters[0]
+picard = parameters[1]
+path_to_manta = parameters[2]
+gridss_path = parameters[3]
+ref = "{}/Reference_data/hg19.fa".format(folder)
+
+with open("{}/Scripts/2_structural_variants/sample_IDs".format(folder), "r") as f:
+	samples = [x.rstrip() for x in f]
+print("Running structural variants calling workflow for samples: {}".format(samples))
+
+
+rule all:
+	input:
+		expand("{folder}/{sample}/SV_calling/{sample}_SV_merged.edited.vcf.gz", folder=folder, sample=samples),
+		expand("{folder}/{sample}/SV_calling/{sample}_SV_merged.norm.vcf.gz", folder=folder, sample=samples)
+
+
+rule samtoolsDP:
+	input:
+		ref="{folder}/Reference_data/hg19.fa",
+		bam="{folder}/{sample}/{sample}_WGS_hg19_recalibrated.sorted.bam"
+	output:
+		DPsorted="{folder}/{sample}/SV_calling/{sample}_discordants.sorted.bam"
+	log:
+		"{folder}/{sample}/Console_outputs/samtoolsDP.{sample}.log"
+	shell:
+		"""
+		exec > {log} 2>&1
+		start=$(date)
+		echo $start
+		echo "Starting samtools discordant reads command for sample {wildcards.sample}"
+		SECONDS=0
+		echo " "
+
+		mkdir -p {folder}/{wildcards.sample}/SV_calling
+		samtools view -b -F 1294 -@ 8 {input.bam} > {folder}/{wildcards.sample}/SV_calling/{wildcards.sample}_discordants.unsorted.bam
+		samtools sort -o {output.DPsorted} -@ 8 {folder}/{wildcards.sample}/SV_calling/{wildcards.sample}_discordants.unsorted.bam
+
+		echo " "
+		end=$(date)
+		echo $end
+		duration=$SECONDS
+		echo "Samtools discordant reads command for sample {wildcards.sample} completed."
+		echo "The analysis completed in $(($duration / 60)) minutes and $(($duration % 60)) seconds elapsed."
+		echo " "
+		"""
+
+
+rule samtoolsSR:
+	input:
+		ref="{folder}/Reference_data/hg19.fa",
+		bam="{folder}/{sample}/{sample}_WGS_hg19_recalibrated.sorted.bam"
+	output:
+		SRsorted="{folder}/{sample}/SV_calling/{sample}_splitters.sorted.bam"
+	log:
+		"{folder}/{sample}/Console_outputs/samtoolsSR.{sample}.log"
+	shell:
+		"""
+		exec > {log} 2>&1
+		start=$(date)
+		echo $start
+		echo "Starting samtools split reads command for sample {wildcards.sample}"
+		SECONDS=0
+		echo " "
+
+		samtools view -@ 8 -h {input.bam} \
+			| {folder}/Scripts/2_structural_variants/extractSplitReads_BwaMem.py -i stdin \
+    		| samtools view -@ 10 -Sb - > {folder}/{wildcards.sample}/SV_calling/{wildcards.sample}_splitters.unsorted.bam
+		samtools sort -o {output.SRsorted} -@ 10 {folder}/{wildcards.sample}/SV_calling/{wildcards.sample}_splitters.unsorted.bam
+		rm {folder}/{wildcards.sample}/SV_calling/{wildcards.sample}_splitters.unsorted.bam
+
+		echo " "
+		end=$(date)
+		echo $end
+		duration=$SECONDS
+		echo "Samtools split reads command for sample {wildcards.sample} completed."
+		echo "The analysis completed in $(($duration / 60)) minutes and $(($duration % 60)) seconds elapsed."
+		echo " "
+		"""
+
+
+rule lumpy:
+	input:
+		bam="{folder}/{sample}/{sample}_WGS_hg19_recalibrated.sorted.bam",
+		SRbam = ancient("{folder}/{sample}/SV_calling/{sample}_splitters.sorted.bam"),
+		DPbam = ancient("{folder}/{sample}/SV_calling/{sample}_discordants.sorted.bam")
+	output:
+		lumpy_vcf = "{folder}/{sample}/SV_calling/Lumpy/{sample}_SV_lumpy.vcf"
+	log:
+		"{folder}/{sample}/Console_outputs/lumpy.{sample}.log"
+	conda:
+		"./envs/SV_packages_py2_env.yaml"
+	shell:
+		"""
+		exec > {log} 2>&1
+		start=$(date)
+		echo $start
+		echo "Starting Lumpy command for sample {wildcards.sample}"
+		SECONDS=0
+		echo " "
+		lumpyexpress \
+			-t 10 \
+    		-B {input.bam} \
+    		-S {input.SRbam} \
+    		-D {input.DPbam} \
+    		-o {output.lumpy_vcf} \
+			-v
+		echo " "
+		end=$(date)
+		echo $end
+		duration=$SECONDS
+		echo "Lumpy SV calling command for sample {wildcards.sample} completed."
+		echo "The analysis completed in $(($duration / 60)) minutes and $(($duration % 60)) seconds elapsed."
+		echo " "
+		"""
+
+
+
+rule SVTyper:
+	input:
+		bam="{folder}/{sample}/{sample}_WGS_hg19_recalibrated.sorted.bam",
+		SRbam = ancient("{folder}/{sample}/SV_calling/{sample}_splitters.sorted.bam"),
+		lumpy_vcf = ancient("{folder}/{sample}/SV_calling/Lumpy/{sample}_SV_lumpy.vcf")
+	output:
+		genotyped_vcf = "{folder}/{sample}/SV_calling/Lumpy/{sample}_SV_lumpy.genotyped.vcf"
+	log:
+		"{folder}/{sample}/Console_outputs/SVTyper.{sample}.log"
+	conda:
+		"./envs/SV_packages_py2_env.yaml"
+	shell:
+		"""
+		exec > {log} 2>&1
+		start=$(date)
+		echo $start
+		echo "Starting SVTyper command for sample {wildcards.sample}"
+		SECONDS=0
+		echo " "
+
+		svtyper \
+    		-B {input.bam} \
+    		-S {input.SRbam} \
+    		-i {input.lumpy_vcf} > {output.genotyped_vcf}
+
+		echo " "
+		end=$(date)
+		echo $end
+		duration=$SECONDS
+		echo "SVTyper genotype calling on Lumpy VCF for sample {wildcards.sample} completed."
+		echo "The analysis completed in $(($duration / 60)) minutes and $(($duration % 60)) seconds elapsed."
+		echo " "
+		"""
+
+
+rule lumpySort:
+	input:
+		lumpy_vcf = ancient("{folder}/{sample}/SV_calling/Lumpy/{sample}_SV_lumpy.genotyped.vcf"),
+		ref_dict = "{folder}/Reference_data/hg19.dict"
+	output:
+		lumpy_sorted = "{folder}/{sample}/SV_calling/Lumpy/{sample}_SV_lumpy.genotyped.sorted.vcf"
+	params:
+		PICARD="{}/picard.jar".format(picard)
+	log:
+		"{folder}/{sample}/Console_outputs/lumpySort.{sample}.log"
+	shell:
+		"""
+		exec > {log} 2>&1
+		start=$(date)
+		echo $start
+		echo "Starting Lumpy command for sample {wildcards.sample}"
+		SECONDS=0
+		echo " "
+
+		java -jar {params.PICARD} SortVcf \
+					-SD {input.ref_dict} \
+					-I {input.lumpy_vcf} \
+					-O {output.lumpy_sorted}
+
+		echo " "
+		end=$(date)
+		echo $end
+		duration=$SECONDS
+		echo "Lumpy SV calling command for sample {wildcards.sample} completed."
+		echo "The analysis completed in $(($duration / 60)) minutes and $(($duration % 60)) seconds elapsed."
+		echo " "
+		"""
+
+rule Manta:
+	input:
+		ref="{folder}/Reference_data/hg19.fa",
+		bam="{folder}/{sample}/{sample}_WGS_hg19_recalibrated.sorted.bam"
+	output:
+		manta="{folder}/{sample}/SV_calling/Manta/results/variants/{sample}_SV_manta_diploidSV.vcf.gz"
+	params:
+		manta_path="{}".format(path_to_manta)
+	log:
+		"{folder}/{sample}/Console_outputs/Manta.{sample}.log"
+	conda:
+		"./envs/SV_packages_py2_env.yaml"
+	shell:
+		"""
+		exec > {log} 2>&1
+		start=$(date)
+		echo $start
+		echo "Starting Manta command for sample {wildcards.sample}"
+		SECONDS=0
+		echo ' '
+
+		{params.manta_path}/bin/configManta.py \
+		--bam {input.bam} \
+		--referenceFasta {input.ref} \
+		--runDir {folder}/{wildcards.sample}/SV_calling/Manta
+
+		{folder}/{wildcards.sample}/SV_calling/Manta/runWorkflow.py
+		mv {folder}/{wildcards.sample}/SV_calling/Manta/results/variants/diploidSV.vcf.gz {folder}/{wildcards.sample}/SV_calling/Manta/results/variants/{wildcards.sample}_SV_manta_diploidSV.vcf.gz
+		mv {folder}/{wildcards.sample}/SV_calling/Manta/results/variants/diploidSV.vcf.gz.tbi {folder}/{wildcards.sample}/SV_calling/Manta/results/variants/{wildcards.sample}_SV_manta_diploidSV.vcf.gz.tbi
+
+		echo ' '
+		end=$(date)
+		echo $end
+		duration=$SECONDS
+		echo 'Manta command for sample {wildcards.sample} completed.'
+		echo "The analysis completed in $(($duration / 60)) minutes and $(($duration % 60)) seconds elapsed."
+		"""
+
+
+
+rule Delly2_SV:
+	input:
+		ref="{folder}/Reference_data/hg19.fa",
+		bam="{folder}/{sample}/{sample}_WGS_hg19_recalibrated.sorted.bam",
+		map="{folder}/Reference_data/Mappability/Homo_sapiens.GRCh37.dna.primary_assembly.fa.r101.s501.blacklist.gz",
+		excl = "{folder}/Reference_data/Mappability/human.hg19.excl.tsv"
+	output:
+		delly_sv = "{folder}/{sample}/SV_calling/Delly2/{sample}_SV_delly_sv.bcf"
+	log:
+		"{folder}/{sample}/Console_outputs/Delly2_SV.{sample}.log"
+	conda:
+		"./envs/SV_packages_py3_env.yaml"
+	shell:
+		"""
+		exec > {log} 2>&1
+		start=$(date)
+		echo $start
+		echo "Starting Delly2 SV command for sample {wildcards.sample}"
+		SECONDS=0
+		echo ' '
+
+		delly call -g {input.ref} -o {output.delly_sv} \
+					-x {input.excl} {input.bam}
+
+		echo ' '
+		end=$(date)
+		echo $end
+		duration=$SECONDS
+		echo 'Delly2 SV command for sample {wildcards.sample} completed.'
+		echo "The analysis completed in $(($duration / 60)) minutes and $(($duration % 60)) seconds elapsed."
+		"""
+
+
+rule Delly2_CNV:
+	input:
+		ref="{folder}/Reference_data/hg19.fa",
+		bam="{folder}/{sample}/{sample}_WGS_hg19_recalibrated.sorted.bam",
+		map="{folder}/Reference_data/Mappability/Homo_sapiens.GRCh37.dna.primary_assembly.fa.r101.s501.blacklist.gz",
+		delly_sv= ancient("{folder}/{sample}/SV_calling/Delly2/{sample}_SV_delly_sv.bcf")
+	output:
+		delly_cnv = "{folder}/{sample}/SV_calling/Delly2/{sample}_SV_delly_cnv.bcf"
+	log:
+		"{folder}/{sample}/Console_outputs/Delly2_CNV.{sample}.log"
+	conda:
+		"./envs/SV_packages_py3_env.yaml"
+	shell:
+		"""
+		exec > {log} 2>&1
+		start=$(date)
+		echo $start
+		echo "Starting Delly2 CNV command for sample {wildcards.sample}"
+		SECONDS=0
+		echo ' '
+
+		delly cnv -o {output.delly_cnv} -g {input.ref} \
+				-m {input.map} -l {input.delly_sv} {input.bam}
+
+		echo ' '
+		end=$(date)
+		echo $end
+		duration=$SECONDS
+		echo 'Delly2 CNV command for sample {wildcards.sample} completed.'
+		echo "The analysis completed in $(($duration / 60)) minutes and $(($duration % 60)) seconds elapsed."
+		"""
+
+
+rule Delly2_conversions:
+	input:
+		delly_sv = ancient("{folder}/{sample}/SV_calling/Delly2/{sample}_SV_delly_sv.bcf"),
+		delly_cnv = ancient("{folder}/{sample}/SV_calling/Delly2/{sample}_SV_delly_cnv.bcf")
+	output:
+		vcf_cnv = "{folder}/{sample}/SV_calling/Delly2/{sample}_SV_delly.cnv.vcf.gz",
+		vcf_sv = "{folder}/{sample}/SV_calling/Delly2/{sample}_SV_delly.sv.vcf.gz"
+	log:
+		"{folder}/{sample}/Console_outputs/Delly2_conversion.{sample}.log"
+	conda:
+		"./envs/SV_packages_py3_env.yaml"
+	shell:
+		"""
+		exec > {log} 2>&1
+		start=$(date)
+		echo $start
+		echo "Starting Delly2 CNV command for sample {wildcards.sample}"
+		SECONDS=0
+		echo ' '
+
+		bcftools view {input.delly_sv} > /dev/stdout \
+			| bgzip -c /dev/stdin > {output.vcf_sv}
+		bcftools view {input.delly_cnv} > /dev/stdout \
+			| bgzip -c /dev/stdin > {output.vcf_cnv}
+
+		tabix -p vcf {output.vcf_sv}
+		tabix -p vcf {output.vcf_cnv}
+
+		echo ' '
+		end=$(date)
+		echo $end
+		duration=$SECONDS
+		echo 'Delly2 outputs conversion command for sample {wildcards.sample} completed.'
+		echo "The analysis completed in $(($duration / 60)) minutes and $(($duration % 60)) seconds elapsed."
+		"""
+
+
+
+rule CNVpytor:
+	input:
+		bam="{folder}/{sample}/{sample}_WGS_hg19_recalibrated.sorted.bam",
+		vcf="{folder}/{sample}/{sample}_WGS_hg19_haplotypecaller_filtered.vcf.gz"
+	output:
+		root="{folder}/{sample}/SV_calling/CNVpytor/{sample}.pytor",
+		out_tsv="{folder}/{sample}/SV_calling/CNVpytor/{sample}_SV_cnvpytor_command.tsv"
+	log:
+		"{folder}/{sample}/Console_outputs/CNVpytor.{sample}.log"
+	conda:
+		"./envs/SV_packages_py3_env.yaml"
+	shell:
+		"""
+		exec > {log} 2>&1
+		start=$(date)
+		echo $start
+		echo "Starting CNVpytor command for sample {wildcards.sample}"
+		SECONDS=0
+		echo ' '
+
+		cnvpytor -root {output.root} -rd {input.bam}
+		cnvpytor -root {output.root} -his 1000 10000 100000
+		cnvpytor -root {output.root} -partition 1000 10000 100000
+		cnvpytor -root {output.root} -call 1000 > {output.out_tsv}
+		cnvpytor -root {output.root} -snp {input.vcf} -sample {wildcards.sample}
+		cnvpytor -root {output.root} -mask_snps
+		cnvpytor -root {output.root} -baf 10000 100000
+		cnvpytor -root {output.root} -genotype 10000 100000
+
+		echo ' '
+		end=$(date)
+		echo $end
+		duration=$SECONDS
+		echo "CNVpytor command for sample {wildcards.sample} completed."
+		echo "The analysis completed in $(($duration / 60)) minutes and $(($duration % 60)) seconds elapsed."
+		"""
+
+
+rule CNVpytor_conversion:
+	input:
+		ref_dir=ancient("{folder}/Reference_data/"),
+		tsv=ancient("{folder}/{sample}/SV_calling/CNVpytor/{sample}_SV_cnvpytor_command.tsv")
+	output:
+		vcf="{folder}/{sample}/SV_calling/CNVpytor/{sample}_SV_cnvpytor.vcf"
+	log:
+		"{folder}/{sample}/Console_outputs/CNVpytor_conversion.{sample}.log"
+	conda:
+		"./envs/SV_packages_py3_env.yaml"
+	shell:
+		"""
+		exec > {log} 2>&1
+		start=$(date)
+		echo $start
+		echo "Starting CNVpytor output conversion to VCF for sample {wildcards.sample}"
+		SECONDS=0
+		echo ' '
+
+		echo {wildcards.sample} > sam_{wildcards.sample}.txt
+		{folder}/Scripts/2_structural_variants/cnvpytor2VCF.pl -prefix {wildcards.sample} -reference hg19 {input.tsv} {input.ref_dir}/chromosomes > {folder}/{wildcards.sample}/SV_calling/CNVpytor/temp.vcf
+		bcftools reheader -s sam_{wildcards.sample}.txt -o {output.vcf} {folder}/{wildcards.sample}/SV_calling/CNVpytor/temp.vcf
+		rm sam_{wildcards.sample}.txt
+		rm {folder}/{wildcards.sample}/SV_calling/CNVpytor/temp.vcf
+
+		echo ' '
+		end=$(date)
+		echo $end
+		duration=$SECONDS
+		echo 'CNVpytor command for sample {wildcards.sample} completed.'
+		echo "The analysis completed in $(($duration / 60)) minutes and $(($duration % 60)) seconds elapsed."
+		"""
+
+
+rule GRIDSS:
+	input:
+		ref="{folder}/Reference_data/hg19.fa",
+		bam="{folder}/{sample}/{sample}_WGS_hg19_recalibrated.sorted.bam",
+		blacklist="{folder}/Reference_data/Mappability/ENCFF001TDO.bed"
+	output:
+		vcf="{folder}/{sample}/SV_calling/GRIDSS/{sample}_SV_gridss.vcf"
+	params:
+		gridss="{}".format(gridss_path)
+	log:
+		"{folder}/{sample}/Console_outputs/GRIDSS.{sample}.log"
+	conda:
+		"./envs/SV_packages_py3_env.yaml"
+	shell:
+		"""
+		exec > {log} 2>&1
+		start=$(date)
+		echo $start
+		echo "Starting GRIDSS command for sample {wildcards.sample}"
+		SECONDS=0
+		echo ' '
+
+		gridss \
+		  -t 8 \
+		  -r {input.ref} \
+		  -j {params.gridss} \
+		  -o {output.vcf} \
+		  -b {input.blacklist} \
+		  --workingdir {folder}/{wildcards.sample}/SV_calling/GRIDSS \
+		  {input.bam}
+
+		echo ' '
+		end=$(date)
+		echo $end
+		duration=$SECONDS
+		echo "GRIDSS command for sample {wildcards.sample} completed."
+		echo "The analysis completed in $(($duration / 60)) minutes and $(($duration % 60)) seconds elapsed."
+		"""
+
+
+rule WHAMg:
+	input:
+		ref="{folder}/Reference_data/hg19.fa",
+		bam="{folder}/{sample}/{sample}_WGS_hg19_recalibrated.sorted.bam"
+	output:
+		vcf=ancient("{folder}/{sample}/SV_calling/WHAM/{sample}_SV_whamg.vcf")
+	params:
+		map="{folder}/Reference_data/Mappability/human.hg19.excl.tsv"
+	log:
+		"{folder}/{sample}/Console_outputs/WHAMg.{sample}.log"
+	conda:
+		"./envs/SV_packages_py3_env.yaml"
+	shell:
+		"""
+		exec > {log} 2>&1
+		start=$(date)
+		echo $start
+		echo "Starting WHAMg command for sample {wildcards.sample}"
+		SECONDS=0
+		echo ' '
+
+		whamg -x 8 -e {params.map} -a {input.ref} -f {input.bam} | perl {folder}/Scripts/2_structural_variants/filtWhamG.pl > {output.vcf}
+
+		echo ' '
+		end=$(date)
+		echo $end
+		duration=$SECONDS
+		echo 'WHAMg command for sample {wildcards.sample} completed.'
+		echo "The analysis completed in $(($duration / 60)) minutes and $(($duration % 60)) seconds elapsed."
+		"""
+
+
+rule VCFs_decompression:
+	input:
+		delly_sv_c="{folder}/{sample}/SV_calling/Delly2/{sample}_SV_delly.sv.vcf.gz",
+		delly_cnv_c="{folder}/{sample}/SV_calling/Delly2/{sample}_SV_delly.cnv.vcf.gz",
+		manta_c="{folder}/{sample}/SV_calling/Manta/results/variants/{sample}_SV_manta_diploidSV.vcf.gz"
+	output:
+		delly_sv="{folder}/{sample}/SV_calling/Delly2/{sample}_SV_delly.sv.vcf",
+		delly_cnv="{folder}/{sample}/SV_calling/Delly2/{sample}_SV_delly.cnv.vcf",
+		manta="{folder}/{sample}/SV_calling/Manta/{sample}_SV_manta_diploidSV.vcf"
+	log:
+		"{folder}/{sample}/Console_outputs/VCFs_decompression.{sample}.log"
+	conda:
+		"./envs/SV_packages_py3_env.yaml"
+	shell:
+		"""
+		exec > {log} 2>&1
+		start=$(date)
+		echo $start
+		echo "Starting SV VCFs decompression command for sample {wildcards.sample}"
+		SECONDS=0
+		echo ' '
+
+		gunzip -c {input.delly_sv_c} > {output.delly_sv}
+		gunzip -c {input.delly_cnv_c} > {output.delly_cnv}
+		gunzip -c {input.manta_c} > {output.manta}
+
+
+		echo ' '
+		end=$(date)
+		echo $end
+		duration=$SECONDS
+		echo 'SV VCFs decompression command for sample {wildcards.sample} completed.'
+		echo "The analysis completed in $(($duration / 60)) minutes and $(($duration % 60)) seconds elapsed."
+		"""
+
+
+rule VCF_harmonization:
+	input:
+		lumpy_in="{folder}/{sample}/SV_calling/Lumpy/{sample}_SV_lumpy.genotyped.sorted.vcf",
+		gridss_in="{folder}/{sample}/SV_calling/GRIDSS/{sample}_SV_gridss.vcf",
+		cnvpytor_in="{folder}/{sample}/SV_calling/CNVpytor/{sample}_SV_cnvpytor.vcf",
+		whamg_in="{folder}/{sample}/SV_calling/WHAM/{sample}_SV_whamg.vcf",
+		delly_sv_in="{folder}/{sample}/SV_calling/Delly2/{sample}_SV_delly.sv.vcf",
+		delly_cnv_in="{folder}/{sample}/SV_calling/Delly2/{sample}_SV_delly.cnv.vcf",
+		manta_in="{folder}/{sample}/SV_calling/Manta/{sample}_SV_manta_diploidSV.vcf"
+	output:
+		lumpy_out="{folder}/{sample}/SV_calling/Lumpy/{sample}_SV_lumpy.edited.vcf",
+		gridss_out="{folder}/{sample}/SV_calling/GRIDSS/{sample}_SV_gridss.edited.vcf",
+		cnvpytor_out="{folder}/{sample}/SV_calling/CNVpytor/{sample}_SV_cnvpytor.edited.vcf",
+		whamg_out="{folder}/{sample}/SV_calling/WHAM/{sample}_SV_whamg.edited.vcf",
+		delly_sv_out="{folder}/{sample}/SV_calling/Delly2/{sample}_SV_delly.sv.edited.vcf",
+		delly_cnv_out="{folder}/{sample}/SV_calling/Delly2/{sample}_SV_delly.cnv.edited.vcf",
+		manta_out="{folder}/{sample}/SV_calling/Manta/{sample}_SV_manta.edited.vcf"
+	log:
+		"{folder}/{sample}/Console_outputs/SV_VCF_harmonization.{sample}.log"
+	script:
+		"{wildcards.folder}/Scripts/2_structural_variants/SV_VCF_harmonization.py"
+
+
+
+rule VCFs_compression_indexing:
+	input:
+		lumpy="{folder}/{sample}/SV_calling/Lumpy/{sample}_SV_lumpy.edited.vcf",
+		gridss="{folder}/{sample}/SV_calling/GRIDSS/{sample}_SV_gridss.edited.vcf",
+		cnvpytor="{folder}/{sample}/SV_calling/CNVpytor/{sample}_SV_cnvpytor.edited.vcf",
+		whamg="{folder}/{sample}/SV_calling/WHAM/{sample}_SV_whamg.edited.vcf",
+		delly_sv="{folder}/{sample}/SV_calling/Delly2/{sample}_SV_delly.sv.edited.vcf",
+		delly_cnv="{folder}/{sample}/SV_calling/Delly2/{sample}_SV_delly.cnv.edited.vcf",
+		manta="{folder}/{sample}/SV_calling/Manta/{sample}_SV_manta.edited.vcf"
+	output:
+		lumpy_c="{folder}/{sample}/SV_calling/Lumpy/{sample}_SV_lumpy.edited.vcf.gz",
+		gridss_c="{folder}/{sample}/SV_calling/GRIDSS/{sample}_SV_gridss.edited.vcf.gz",
+		cnvpytor_c="{folder}/{sample}/SV_calling/CNVpytor/{sample}_SV_cnvpytor.edited.vcf.gz",
+		whamg_c="{folder}/{sample}/SV_calling/WHAM/{sample}_SV_whamg.edited.vcf.gz",
+		delly_sv_c="{folder}/{sample}/SV_calling/Delly2/{sample}_SV_delly.sv.edited.vcf.gz",
+		delly_cnv_c="{folder}/{sample}/SV_calling/Delly2/{sample}_SV_delly.cnv.edited.vcf.gz",
+		manta_c="{folder}/{sample}/SV_calling/Manta/{sample}_SV_manta.edited.vcf.gz"
+	log:
+		"{folder}/{sample}/Console_outputs/VCFs_compression_indexing.{sample}.log"
+	conda:
+		"./envs/SV_packages_py3_env.yaml"
+	shell:
+		"""
+		exec > {log} 2>&1
+		start=$(date)
+		echo $start
+		echo "Starting SV VCFs compression and indexing command for sample {wildcards.sample}"
+		SECONDS=0
+		echo ' '
+
+		bgzip -c {input.lumpy} > {output.lumpy_c}
+		tabix -p vcf {output.lumpy_c}
+
+		bgzip -c {input.gridss} > {output.gridss_c}
+		tabix -p vcf {output.gridss_c}
+
+		bgzip -c {input.cnvpytor} > {output.cnvpytor_c}
+		tabix -p vcf {output.cnvpytor_c}
+
+		bgzip -c {input.whamg} > {output.whamg_c}
+		tabix -p vcf {output.whamg_c}
+
+		bgzip -c {input.delly_sv} > {output.delly_sv_c}
+		tabix -p vcf {output.delly_sv_c}
+
+		bgzip -c {input.delly_cnv} > {output.delly_cnv_c}
+		tabix -p vcf {output.delly_cnv_c}
+
+		bgzip -c {input.manta} > {output.manta_c}
+		tabix -p vcf {output.manta_c}
+
+		echo ' '
+		end=$(date)
+		echo $end
+		duration=$SECONDS
+		echo 'SV VCFs compression and indexing command for sample {wildcards.sample} completed.'
+		echo "The analysis completed in $(($duration / 60)) minutes and $(($duration % 60)) seconds elapsed."
+		"""
+
+
+rule VCFmerging:
+	input:
+		lumpy="{folder}/{sample}/SV_calling/Lumpy/{sample}_SV_lumpy.edited.vcf.gz",
+		gridss="{folder}/{sample}/SV_calling/GRIDSS/{sample}_SV_gridss.edited.vcf.gz",
+		cnvpytor="{folder}/{sample}/SV_calling/CNVpytor/{sample}_SV_cnvpytor.edited.vcf.gz",
+		whamg="{folder}/{sample}/SV_calling/WHAM/{sample}_SV_whamg.edited.vcf.gz",
+		delly_sv="{folder}/{sample}/SV_calling/Delly2/{sample}_SV_delly.sv.edited.vcf.gz",
+		delly_cnv="{folder}/{sample}/SV_calling/Delly2/{sample}_SV_delly.cnv.edited.vcf.gz",
+		manta="{folder}/{sample}/SV_calling/Manta/{sample}_SV_manta.edited.vcf.gz"
+	output:
+		merged="{folder}/{sample}/SV_calling/{sample}_SV_merged.edited.vcf.gz"
+	log:
+		"{folder}/{sample}/Console_outputs/VCFmerging.{sample}.log"
+	conda:
+		"./envs/SV_packages_py3_env.yaml"
+	shell:
+		"""
+		exec > {log} 2>&1
+		start=$(date)
+		echo $start
+		echo "Starting SV VCFs merging command for sample {wildcards.sample}"
+		SECONDS=0
+		echo ' '
+
+		bcftools concat -a {input.lumpy} \
+                    {input.gridss} \
+                    {input.manta} \
+                    {input.cnvpytor} \
+                    {input.delly_sv} \
+                    {input.delly_cnv} \
+                    {input.whamg} > {folder}/{wildcards.sample}/SV_calling/{wildcards.sample}_SV_merged.edited.vcf
+
+		bgzip -c {folder}/{wildcards.sample}/SV_calling/{wildcards.sample}_SV_merged.edited.vcf > {output.merged}
+		tabix -p vcf {output.merged}
+
+		echo ' '
+		end=$(date)
+		echo $end
+		duration=$SECONDS
+		echo 'SV VCFs merging command for sample {wildcards.sample} completed.'
+		echo "The analysis completed in $(($duration / 60)) minutes and $(($duration % 60)) seconds elapsed."
+		"""
+
+
+rule Normalize_merged_SV_VCF:
+	input:
+		ref="{folder}/Reference_data/hg19.fa",
+		merged_vcf="{folder}/{sample}/SV_calling/{sample}_SV_merged.edited.vcf.gz"
+	output:
+		norm_vcf="{folder}/{sample}/SV_calling/{sample}_SV_merged.norm.vcf.gz"
+	params:
+		TMP_DIR="/home/analyst/intermediate_results"
+	log:
+		log="{folder}/{sample}/Console_outputs/Normalize_merged_SV_VCF.{sample}.log"
+	conda:
+		"./envs/bcftools_env.yml"
+	shell:
+		"""
+		start=$(date)
+		echo $start
+		echo "Starting normalization of merged SV VCF for sample {wildcards.sample}"
+		SECONDS=0
+		echo " "
+
+		bcftools norm -c w -f {input.ref} -m -any -o {output.norm_vcf} {input.merged_vcf} &> {log.log}
+		tabix -p vcf {output.norm_vcf}
+
+		echo " "
+		end=$(date)
+		echo $end
+		duration=$SECONDS
+		echo "Normalization of merged SV VCF for sample {wildcards.sample} completed."
+		echo "The analysis completed in $(($duration / 60)) minutes and $(($duration % 60)) seconds elapsed."
+		"""

@@ -1,0 +1,151 @@
+import os.path as osp
+import re
+
+parameters_file = "./parameters"
+parameters_df = pd.read_csv(parameters_file, sep='\t')
+parameters = parameters_df['locations'].tolist()
+
+folder = parameters[0]
+genes_list = parameters[1]
+
+with open("sample_IDs.txt", "r") as f:
+	samples = [x.rstrip() for x in f]
+
+print('Starting Nirvana annotation and decoding pipeline for samples: {}'.format(samples))
+
+rule all:
+	input:
+		expand("{folder}/{sample}/{sample}_WGS_hg19_haplotypecaller.nirvana.annotated.json.gz", folder=folder, sample=samples),
+		expand("{folder}/{sample}/{sample}_WGS_hg19_deepvariant.nirvana.annotated.json.gz", folder=folder, sample=samples),
+		expand("{folder}/{sample}/Filtered_variants/{sample}_Nirvana_combined_rare_variants.IRD_genes_list.tsv", folder=folder, sample=samples),
+		expand("{folder}/{sample}/Filtered_variants/{sample}_Nirvana_rare_SV_variants.IRD_genes_list.tsv", folder=folder, sample=samples)
+
+
+rule Nirvana_HC:
+	input:
+		vcf="{folder}/{sample}/{sample}_WGS_hg19_haplotypecaller.norm.vcf.gz"
+	output:
+		json="{folder}/{sample}/{sample}_WGS_hg19_haplotypecaller.nirvana.annotated.json.gz"
+	log:
+		"{folder}/{sample}/Console_outputs/Nirvana_HC.{sample}.out"
+	shell:
+		"""
+		exec > {log} 2>&1
+		start=$(date)
+		echo $start
+		echo "Starting Nirvana annotation command on HaplotypeCaller VCF for sample {wildcards.sample}"
+		echo " "
+
+		dotnet {wildcards.folder}/Nirvana/Nirvana.dll \
+             -c {wildcards.folder}/Nirvana/Data/Cache/GRCh37/Both \
+             --sd {wildcards.folder}/Nirvana/Data/SupplementaryAnnotation/GRCh37 \
+			 --sd {wildcards.folder}/Nirvana/Data/CustomAnnotationFiles \
+             -r {wildcards.folder}/Nirvana/Data/References/Homo_sapiens.GRCh37.Nirvana.dat \
+             -i {input.vcf} \
+             -o {wildcards.folder}/{wildcards.sample}/{wildcards.sample}_WGS_hg19_haplotypecaller.nirvana.annotated
+
+		echo " "
+		end=$(date)
+		echo $end
+		echo "Nirvana annotation command on HaplotypeCaller VCF for sample {wildcards.sample} completed."
+		echo " "
+		"""
+
+rule Nirvana_DV:
+	input:
+		vcf="{folder}/{sample}/{sample}_WGS_hg19_DeepVariant.norm.vcf.gz"
+	output:
+		json="{folder}/{sample}/{sample}_WGS_hg19_deepvariant.nirvana.annotated.json.gz"
+	log:
+		"{folder}/{sample}/Console_outputs/Nirvana_DV.{sample}.out"
+	shell:
+		"""
+		exec > {log} 2>&1
+		start=$(date)
+		echo $start
+		echo "Starting Nirvana annotation command on DeepVariant VCF for sample {wildcards.sample}"
+		echo " "
+
+		dotnet {wildcards.folder}/Nirvana/Nirvana.dll \
+             -c {wildcards.folder}/Nirvana/Data/Cache/GRCh37/Both \
+             --sd {wildcards.folder}/Nirvana/Data/SupplementaryAnnotation/GRCh37 \
+			 --sd {wildcards.folder}/Nirvana/Data/CustomAnnotationFiles \
+             -r {wildcards.folder}/Nirvana/Data/References/Homo_sapiens.GRCh37.Nirvana.dat \
+             -i {input.vcf} \
+             -o {wildcards.folder}/{wildcards.sample}/{wildcards.sample}_WGS_hg19_deepvariant.nirvana.annotated
+
+		echo " "
+		end=$(date)
+		echo $end
+		echo "Nirvana annotation command on DeepVariant VCF for sample {wildcards.sample} completed."
+		echo " "
+		"""
+
+
+rule Nirvana_SV:
+	input:
+		vcf="{folder}/{sample}/SV_calling/{sample}_SV_merged.norm.vcf.gz"
+	output:
+		json="{folder}/{sample}/SV_calling/{sample}_WGS_hg19_SV_merged.nirvana.annotated.json.gz"
+	log:
+		"{folder}/{sample}/Console_outputs/Nirvana_SV.{sample}.log"
+	shell:
+		"""
+		exec > {log} 2>&1
+		start=$(date)
+		echo $start
+		echo "Starting Nirvana annotation command on SV merged VCF for sample {wildcards.sample}"
+		echo " "
+
+		dotnet {wildcards.folder}/Nirvana/Nirvana.dll \
+             -c {wildcards.folder}/Nirvana/Data/Cache/GRCh37/Both \
+             --sd {wildcards.folder}/Nirvana/Data/SupplementaryAnnotation/GRCh37 \
+			 --sd {wildcards.folder}/Nirvana/Data/CustomAnnotationFiles \
+             -r {wildcards.folder}/Nirvana/Data/References/Homo_sapiens.GRCh37.Nirvana.dat \
+             -i {input.vcf} \
+             -o {wildcards.folder}/{wildcards.sample}/SV_calling/{wildcards.sample}_WGS_hg19_SV_merged.nirvana.annotated
+
+		echo " "
+		end=$(date)
+		echo $end
+		echo "Nirvana annotation command on SV merged VCF for sample {wildcards.sample} completed."
+		echo " "
+		"""
+
+
+rule JsonDecoding_short:
+	input:
+		dv="{folder}/{sample}/{sample}_WGS_hg19_deepvariant.nirvana.annotated.json.gz",
+		hc="{folder}/{sample}/{sample}_WGS_hg19_haplotypecaller.nirvana.annotated.json.gz",
+		genes_list="{}".format(genes_list)
+	output:
+		rare="{folder}/{sample}/Filtered_variants/{sample}_Nirvana_combined_rare_short_variants.IRD_genes_list.tsv"
+	log:
+		log="{folder}/{sample}/Console_outputs/Nirvana_JsonDecoding_short.{sample}.out"
+	script:
+		"{folder}/Scripts/3_Nirvana/Nirvana_decoding_WGS_VCFs_genes_list.py"
+
+
+rule JsonDecoding_SV:
+	input:
+		sv="{folder}/{sample}/SV_calling/{sample}_WGS_hg19_SV_merged.nirvana.annotated.json.gz",
+		genes_list="{}".format(genes_list)
+	output:
+		rare="{folder}/{sample}/Filtered_variants/{sample}_Nirvana_rare_SV_variants.IRD_genes_list.tsv"
+	log:
+		log="{folder}/{sample}/Console_outputs/Nirvana_JsonDecoding_SV.{sample}.out"
+	script:
+		"{wildcards.folder}/Scripts/3_Nirvana/Nirvana_decoding_filtering_SV.py"
+
+
+rule Merge_Filtered_tsv_files:
+	input:
+		short="{folder}/{sample}/Filtered_variants/{sample}_Nirvana_combined_rare_short_variants.IRD_genes_list.tsv",
+		sv="{folder}/{sample}/Filtered_variants/{sample}_Nirvana_rare_SV_variants.IRD_genes_list.tsv",
+		genes_list="{}".format(genes_list)
+	output:
+		rare="{folder}/{sample}/Filtered_variants/{sample}_Nirvana_combined_rare_variants.IRD_genes_list.tsv"
+	log:
+		log="{folder}/{sample}/Console_outputs/Merge_Filtered_tsv_files.{sample}.out"
+	script:
+		"{wildcards.folder}/Scripts/3_Nirvana/Merge_filtered_tsv_files.py"

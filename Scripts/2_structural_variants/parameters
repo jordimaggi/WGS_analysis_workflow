@@ -1,0 +1,5 @@
+locations
+/home/USE/WGS_analysis_workflow
+/home/USER/anaconda3/envs/snakemake_env/share/picard-2.27.2-0
+/home/USER/anaconda3/envs/SV_packages_py2_env/share/manta-1.6.0-2
+/home/USER/anaconda3/envs/SV_packages_py3_env/share/gridss-2.11.1-1/gridss.jar
