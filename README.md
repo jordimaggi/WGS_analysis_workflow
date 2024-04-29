@@ -16,4 +16,4 @@ The second pipeline (**Snakefile_SV_pipeline**) produces strctural variant calls
 
 The third pipeline (**Snakefile_Nirvana**) integrates Nirvana to annotate all variants and finally merges and filters the annotated variants based on a genes list of interest (Fig. 1).
 
-The workflows were run in the conda environment <code>snakemake_env</code>, which can be installed using conda with the <code>snakemake_env.yml</code> file.
+The workflows were run in the conda environment <code>snakemake_env</code>, which can be recreated using conda with the <code>snakemake_env.yml</code> file.
