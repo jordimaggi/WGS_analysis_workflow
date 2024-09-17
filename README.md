@@ -1,4 +1,4 @@
-# WGS_anaylsis_workflow
+# WGS_analysis_workflow
 
 The repository contains the analysis workflow used to analyze whole-genome sequencing datasets generated during this study: [**<em>add publication DOI here</em>**].
 The workflow is based around several tools that have been incorporated into 3 Snakemake pipelines (Fig. 1).
